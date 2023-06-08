@@ -5,7 +5,7 @@ import org.apache.iceberg.util.SnapshotUtil
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.functions.lit
-import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
+import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
 
 import java.time.temporal.ChronoUnit
 import java.time.{LocalDateTime, ZoneOffset}
@@ -38,6 +38,9 @@ object Main extends Logging{
       .getOrCreate()
 
     import spark.implicits._
+
+    testCDCOnMerge(spark)
+    return
 
     highlight("Current customers table")
     spark.sql("select * from cat.mydb.customers").show(10, false)
@@ -161,6 +164,73 @@ object Main extends Logging{
          |""".stripMargin
     )
     sparkSession.sql("SELECT *  FROM cdcView")
+
+  }
+
+  private def testCDCOnMerge(sparkSession: SparkSession):Unit = {
+    val tableName = "cat.mydb.test_cdc"
+    val catalogName = "cat"
+    sparkSession.sql(s"DROP TABLE IF EXISTS $tableName")
+    sparkSession.sql(
+      s"""
+        |CREATE TABLE IF NOT EXISTS  $tableName (id bigint, name string, category string) USING iceberg
+        |""".stripMargin)
+
+    // Data to be inserted
+    val data = Seq(
+      (1L, "Alice", "Engineer"),
+      (2L, "Bob", "Scientist"),
+      (3L, "Charlie", "Technician")
+    )
+    // Create DataFrame from the sequence of tuples
+    val df = sparkSession.createDataFrame(data).toDF("id", "name", "category")
+    df.writeTo("cat.mydb.test_cdc").append()
+    sparkSession.sql("select * from cat.mydb.test_cdc").show()
+    // new data with just one field that has changed
+    val newData = Seq(
+      (1L, "Alice", "Engineer"),
+      (2L, "Bob", "Scientist"),
+      (3L, "Charlie", "Clown"),
+      (4L, "David", "Technician")
+    )
+    // merge this new data into the table
+    val newDF = sparkSession.createDataFrame(newData).toDF("id", "name", "category")
+    // create a view
+    newDF.createOrReplaceTempView("newData")
+    val mergeQuery =
+      """
+        |MERGE INTO cat.mydb.test_cdc target
+        |USING newData source
+        |ON target.id = source.id
+        |WHEN MATCHED THEN
+        | UPDATE SET *
+        | WHEN NOT MATCHED THEN
+        | INSERT *
+        |""".stripMargin
+    sparkSession.sql(mergeQuery)
+    sparkSession.sql("select * from cat.mydb.test_cdc").show()
+    val tableRef = Spark3Util.loadIcebergTable(sparkSession, tableName)
+    val lastSnapshotIndex = tableRef.history().size() - 1
+    val curSnapshotID = tableRef.history().get(lastSnapshotIndex).snapshotId()
+    val preSnapshotID = tableRef.history().get(lastSnapshotIndex - 1).snapshotId()
+
+    sparkSession.sql(
+      s"""
+         |CALL $catalogName.system.create_changelog_view(table => '$tableName',
+         |changelog_view => 'cdcView',
+         |compute_updates => true,
+         |remove_carryovers => true,
+         |identifier_columns => array('id'),
+         | options => map (
+         |    'start-snapshot-id',$preSnapshotID
+         |    ,'end-snapshot-id',$curSnapshotID
+         |    )
+         | )
+         |""".stripMargin
+    )
+    sparkSession.sql("SELECT *  FROM cdcView").show()
+
+
 
   }
 
